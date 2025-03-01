@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import re
 import time
-from urllib.parse import urlparse
 
 # AWS Configuration
 AWS_REGION = "us-east-1"
@@ -11,9 +10,9 @@ S3_BUCKET = "ak-47-solutions"
 S3_PREFIX = "pns-data/"
 bedrock_client = boto3.client("bedrock-runtime", region_name=AWS_REGION)
 transcribe_client = boto3.client("transcribe", region_name=AWS_REGION)
-s3_client = boto3.client("s3")
+s3_client = boto3.client("s3", region_name=AWS_REGION)
 
-# Commodity Units
+# Commodity Units Mapping
 COMMODITY_UNITS = {
     "amul_pure_ghee": "KG",
     "basil_seeds": "KG",
@@ -28,17 +27,30 @@ COMMODITY_UNITS = {
     "white_phynl": "KG"
 }
 
+# Function to read CSV from S3
 def read_csv_from_s3(bucket, key):
     obj = s3_client.get_object(Bucket=bucket, Key=key)
-    return pd.read_csv(obj["Body"])
+    df = pd.read_csv(obj["Body"], header=0)  # Ensure headers are read correctly
+    df.columns = df.columns.str.strip()  # Remove any leading/trailing spaces
+    print("CSV Columns:", df.columns)  # Debugging output
 
-# Function to extract numbers from text
+    # Identify the correct column for processing
+    if "Output" in df.columns:
+        data_column = "Output"
+    elif "Recording Link" in df.columns:
+        data_column = "Recording Link"
+    else:
+        raise KeyError("CSV file must contain either 'Output' or 'Recording Link' column.")
+
+    return df, data_column
+
+# Function to extract numeric price values from text
 def extract_price(text):
     prices = re.findall(r'\b\d{2,6}\b', text)  # Extract numbers with 2-6 digits
     prices = [int(p) for p in prices if 10 <= int(p) <= 100000]  # Filter reasonable price values
     return prices
 
-# Function to use Bedrock Claude for price extraction
+# Function to use Amazon Bedrock for price extraction
 def get_price_from_text(text):
     prompt = f"Extract all possible price values in INR from this text related to product pricing:\n\n{text}"
     response = bedrock_client.invoke_model(
@@ -60,49 +72,47 @@ def transcribe_audio(audio_url):
         LanguageCode="en-US",
         OutputBucketName=S3_BUCKET
     )
-    
+
     # Wait for job to complete
     while True:
         status = transcribe_client.get_transcription_job(TranscriptionJobName=job_name)
         if status["TranscriptionJob"]["TranscriptionJobStatus"] in ["COMPLETED", "FAILED"]:
             break
         time.sleep(5)
-    
+
     if status["TranscriptionJob"]["TranscriptionJobStatus"] == "COMPLETED":
         transcript_uri = status["TranscriptionJob"]["Transcript"]["TranscriptFileUri"]
         transcript_text = s3_client.get_object(Bucket=S3_BUCKET, Key=transcript_uri.split("/")[-1])["Body"].read().decode("utf-8")
         return transcript_text
     return ""
 
-# Process all CSV files
+# Main processing for all commodities
 commodity_prices = {}
+
 for commodity in COMMODITY_UNITS.keys():
-    csv_url = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{S3_PREFIX}{commodity}.csv"
-    
-    # Read CSV from S3
-    print(csv_url)
-    
-
     csv_key = f"{S3_PREFIX}{commodity}.csv"
-    df = read_csv_from_s3(S3_BUCKET, csv_key)
-
-    df["Prices"] = [[] for _ in range(len(df))]
     
+    try:
+        df, data_column = read_csv_from_s3(S3_BUCKET, csv_key)  # Identify correct column
+    except Exception as e:
+        print(f"Error reading {commodity}.csv: {e}")
+        continue  # Skip this commodity if there's an error
+
+    df["Prices"] = [[] for _ in range(len(df))]  # Initialize Prices column with empty lists
 
     for index, row in df.iterrows():
-        output = row["Output"]
-        if output.startswith("http"):
-            # If it's an audio file, transcribe it
-            transcript = transcribe_audio(output)
+        output = row[data_column]  # Use correct column dynamically
+
+        if data_column == "Recording Link":
+            transcript = transcribe_audio(output)  # Transcribe if audio link
             prices = get_price_from_text(transcript)
         else:
-            # If it's a transcript, extract prices directly
-            prices = get_price_from_text(output)
+            prices = get_price_from_text(output)  # Extract prices from transcript
+        
+        df.at[index, "Prices"] = prices  # Store extracted prices
 
-        df.at[index, "Prices"] = prices
-    
-    # Flatten price list
-    all_prices = [p for sublist in df["Prices"] for p in sublist]
+    # Aggregate prices for the commodity
+    all_prices = [p for sublist in df["Prices"] for p in sublist]  # Flatten list
     if all_prices:
         commodity_prices[commodity] = {
             "Mean": np.mean(all_prices),
@@ -113,11 +123,10 @@ for commodity in COMMODITY_UNITS.keys():
 
 # Create final DataFrame
 final_df = pd.DataFrame.from_dict(commodity_prices, orient="index").reset_index()
-final_df.columns = ["Commodity", "Mean", "Median", "5th per", "95th per"]
+final_df.columns = ["Commodity", "Mean", "Median", "5th Percentile", "95th Percentile"]
 
-# Save to CSV
+# Save to CSV and upload to S3
 final_csv_path = "/tmp/commodity_prices.csv"
 final_df.to_csv(final_csv_path, index=False)
-print(f"Final CSV saved at: {final_csv_path}")
-
-
+s3_client.upload_file(final_csv_path, S3_BUCKET, "commodity_prices_summary.csv")
+print(f"Final CSV saved at: {final_csv_path} and uploaded to S3 as commodity_prices_summary.csv")
