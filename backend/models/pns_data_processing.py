@@ -86,8 +86,9 @@ for commodity in COMMODITY_UNITS.keys():
     csv_key = f"{S3_PREFIX}{commodity}.csv"
     df = read_csv_from_s3(S3_BUCKET, csv_key)
 
-    df["Prices"] = []
+    df["Prices"] = [[] for _ in range(len(df))]
     
+
     for index, row in df.iterrows():
         output = row["Output"]
         if output.startswith("http"):
@@ -97,7 +98,7 @@ for commodity in COMMODITY_UNITS.keys():
         else:
             # If it's a transcript, extract prices directly
             prices = get_price_from_text(output)
-        
+
         df.at[index, "Prices"] = prices
     
     # Flatten price list
